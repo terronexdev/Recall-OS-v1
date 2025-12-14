@@ -1,0 +1,9 @@
+{
+  "name": "Recall OS",
+  "description": "An AI-native operating system interface where files are replaced by living, searchable memories (.recall). Powered by Google Gemini.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone",
+    "geolocation"
+  ]
+}
