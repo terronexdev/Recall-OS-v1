@@ -16,6 +16,15 @@ export interface SemanticDiff {
   author: 'user' | 'system' | 'gemini';
 }
 
+export interface FinancialData {
+  amount?: number;
+  currency?: string;
+  date?: string; // ISO Date YYYY-MM-DD
+  category?: string; // e.g., "Utility", "Tax", "Groceries"
+  entity?: string; // Vendor, Sender, or Bank Name
+  lineItems?: string[]; // Brief summary of what was bought
+}
+
 export interface RecallMetadata {
   location?: string;
   weather?: string;
@@ -23,6 +32,7 @@ export interface RecallMetadata {
   tags: string[];
   sourceApp?: string; // e.g., "Chrome", "Camera"
   fileSize?: string;
+  financial?: FinancialData; // New structured data field
 }
 
 export interface RecallFile {

@@ -107,9 +107,40 @@ export default function App() {
       setStatus("Memory Deleted");
   };
 
+  // --- Robust Drag & Drop Handling ---
+
+  const handleDragEnter = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDraggingFile(true);
+  };
+
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    // Explicitly confirm this is a copy operation to the browser
+    e.dataTransfer.dropEffect = 'copy';
+    if (!isDraggingFile) setIsDraggingFile(true);
+  };
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    
+    // Crucial: Only turn off if we are actually leaving the window/container
+    // If we are just entering a child element (relatedTarget), do nothing.
+    if (e.relatedTarget && e.currentTarget.contains(e.relatedTarget as Node)) {
+        return;
+    }
+    
+    setIsDraggingFile(false);
+  };
+
   const handleDrop = async (e: React.DragEvent) => {
     e.preventDefault();
+    e.stopPropagation();
     setIsDraggingFile(false);
+    
     const files = Array.from(e.dataTransfer.files) as File[];
     if (files.length === 0) return;
 
@@ -168,12 +199,17 @@ export default function App() {
           
           newMemoriesBatch.push(newMemory);
         } catch (err) {
-          console.error(err);
+          console.error("Ingestion Error for file:", file.name, err);
+          setStatus(`Error reading ${file.name}`);
         }
     }
     
-    setMemories(prev => [...newMemoriesBatch, ...prev]);
-    setStatus("System Ready");
+    if (newMemoriesBatch.length > 0) {
+        setMemories(prev => [...newMemoriesBatch, ...prev]);
+        setStatus("System Ready");
+    } else {
+        setStatus("Import Failed or Empty");
+    }
   };
 
   const handleCommand = async () => {
@@ -191,8 +227,72 @@ export default function App() {
           }));
           setStatus(result.reasoning);
       } else if (result.type === 'update') {
-          // Handle update logic if needed at top level, usually handled in viewer
+          // Handle specific file update
+          setMemories(prev => prev.map(m => {
+              if (m.id === result.id) {
+                  return {
+                      ...m,
+                      content: result.content,
+                      updatedAt: Date.now(),
+                      history: [...m.history, {
+                          id: crypto.randomUUID(),
+                          timestamp: Date.now(),
+                          description: result.reasoning,
+                          content: result.content,
+                          author: 'gemini'
+                      }]
+                  };
+              }
+              return m;
+          }));
           setStatus(result.reasoning);
+      } else if (result.type === 'create') {
+          // --- HANDLE GENERATIVE CREATION ---
+          
+          // 1. Calculate Position: Center of sources OR Center of screen
+          let targetX = 600;
+          let targetY = 400;
+          
+          if (result.sourceIds && result.sourceIds.length > 0) {
+              const sources = memories.filter(m => result.sourceIds.includes(m.id));
+              if (sources.length > 0) {
+                  const avgX = sources.reduce((sum, m) => sum + (m.x || 0), 0) / sources.length;
+                  const avgY = sources.reduce((sum, m) => sum + (m.y || 0), 0) / sources.length;
+                  targetX = avgX + 100; // Offset slightly
+                  targetY = avgY + 50;
+              }
+          }
+
+          const newType = result.memoryType as RecallType || RecallType.TEXT;
+
+          const newMemory: RecallFile = {
+              id: crypto.randomUUID(),
+              title: result.title,
+              description: result.reasoning,
+              type: newType,
+              content: result.content,
+              thumbnail: (newType === RecallType.IMAGE) ? result.content : '',
+              createdAt: Date.now(),
+              updatedAt: Date.now(),
+              metadata: {
+                  tags: result.tags || ['agent-created'],
+                  mood: 'neutral',
+                  sourceApp: 'Gemini Agent'
+              },
+              history: [{
+                  id: crypto.randomUUID(),
+                  timestamp: Date.now(),
+                  description: 'Created by Agent',
+                  author: 'gemini',
+                  content: result.content
+              }],
+              x: targetX,
+              y: targetY
+          };
+          
+          setMemories(prev => [...prev, newMemory]);
+          setStatus(result.reasoning);
+
       } else {
           setStatus(result.message);
       }
@@ -204,8 +304,9 @@ export default function App() {
   return (
     <div 
         className="w-screen h-screen bg-[#050505] text-white overflow-hidden relative"
-        onDragOver={(e) => { e.preventDefault(); setIsDraggingFile(true); }}
-        onDragLeave={() => setIsDraggingFile(false)}
+        onDragEnter={handleDragEnter}
+        onDragOver={handleDragOver}
+        onDragLeave={handleDragLeave}
         onDrop={handleDrop}
     >
         {/* Background Ambient Glow */}
@@ -246,8 +347,10 @@ export default function App() {
         </div>
 
         {/* 3. Ingestion Overlay */}
+        {/* We use pointer-events-none to prevent the overlay itself from becoming the drop target and causing flicker,
+            UNLESS we handle drag events on it explicitly. Here, we rely on the parent container. */}
         {isDraggingFile && (
-            <div className="absolute inset-0 z-[60] bg-cyan-500/10 backdrop-blur-sm flex items-center justify-center border-4 border-cyan-500/30 m-4 rounded-3xl">
+            <div className="absolute inset-0 z-[60] bg-cyan-500/10 backdrop-blur-sm flex items-center justify-center border-4 border-cyan-500/30 m-4 rounded-3xl pointer-events-none">
                 <h1 className="text-4xl font-black text-cyan-400 tracking-widest animate-pulse">INGEST DATA</h1>
             </div>
         )}

@@ -27,11 +27,21 @@ export const ingestRecall = async (
     const isSupportedBinary = isImage || isVideo || isAudio || isPdf;
 
     let prompt = `Analyze this file named "${filename}" for the 'Recall OS'. 
+    
+    You are a Data Ingestion Agent. Your goal is to extract STRUCTURED DATA.
+    
     Generate a JSON object with:
-    1. 'title': A clean, formatted title based on the filename or content.
-    2. 'description': A concise summary of the content.
-    3. 'tags': A list of 5 semantic search tags.
-    4. 'mood': The emotional vibe or professional context.
+    1. 'title': A clean, formatted title.
+    2. 'description': A concise summary.
+    3. 'tags': 5 semantic search tags (include project names, years, document types).
+    4. 'mood': The emotional vibe.
+    5. 'financial': {
+         "amount": number | null (Total value/cost found),
+         "currency": string | null (USD, EUR, etc),
+         "date": string | null (ISO YYYY-MM-DD found in doc),
+         "category": string | null (e.g. "Invoice", "Utility", "Tax", "Payroll", "Receipt"),
+         "entity": string | null (Vendor name, Bank name, or Project Name)
+       }
     `;
 
     const contents = [];
@@ -77,7 +87,8 @@ export const ingestRecall = async (
         tags: analysis.tags || [],
         mood: analysis.mood || "neutral",
         location: "Unknown",
-        sourceApp: "Drag & Drop"
+        sourceApp: "Drag & Drop",
+        financial: analysis.financial || {}
       }
     };
 
@@ -221,7 +232,7 @@ export const editMemoryContent = async (
 // Tool Definition: Update Content (Text/Code/Docs)
 const toolUpdateMemory: FunctionDeclaration = {
   name: "updateMemoryContent",
-  description: "Update the text content of a memory file based on user instructions. Use this for editing code, rewriting resumes, fixing typos, or appending info.",
+  description: "Update the text content of a memory file. Use this for editing code, rewriting resumes, fixing typos, or appending info.",
   parameters: {
     type: Type.OBJECT,
     properties: {
@@ -230,6 +241,24 @@ const toolUpdateMemory: FunctionDeclaration = {
       reasoning: { type: Type.STRING, description: "Short explanation of what changed." }
     },
     required: ["id", "newContent", "reasoning"]
+  }
+};
+
+// Tool Definition: Create New Memory (Generative)
+const toolCreateMemory: FunctionDeclaration = {
+  name: "createMemory",
+  description: "Create a NEW memory file. Use this for reports, financial summaries, extracting data lists, code generation, or montages.",
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      title: { type: Type.STRING },
+      type: { type: Type.STRING, enum: ["TEXT", "DOCUMENT", "IMAGE", "AUDIO", "VIDEO"] },
+      content: { type: Type.STRING, description: "The content of the new file. For reports, use Markdown tables." },
+      reasoning: { type: Type.STRING },
+      sourceIds: { type: Type.ARRAY, items: { type: Type.STRING }, description: "IDs of memories used to generate this." },
+      tags: { type: Type.ARRAY, items: { type: Type.STRING } }
+    },
+    required: ["title", "type", "content", "reasoning"]
   }
 };
 
@@ -261,24 +290,28 @@ const toolOrganizeCanvas: FunctionDeclaration = {
 export type AgentResponse = 
   | { type: 'chat', message: string }
   | { type: 'update', id: string, content: string, reasoning: string }
+  | { type: 'create', title: string, memoryType: string, content: string, reasoning: string, sourceIds: string[], tags: string[] }
   | { type: 'move', layout: {id: string, x: number, y: number}[], reasoning: string };
 
 /**
- * The Brain: Handles natural language commands to Edit files OR Move them.
+ * The Brain: Handles natural language commands to Edit files, Move them, or Create new ones.
  */
 export const runAgenticCommand = async (
   command: string, 
   memories: RecallFile[]
 ): Promise<AgentResponse> => {
   try {
-    // 1. Prepare Context (Limit content length for token sanity)
+    // 1. Prepare Context with enhanced metadata for financial/quantitative reasoning
     const context = memories.map(m => ({
       id: m.id,
       title: m.title,
       type: m.type,
       tags: m.metadata.tags,
-      // Only include content if it's text-based and reasonably sized, otherwise just metadata
-      contentPreview: (m.type === RecallType.TEXT || m.type === RecallType.DOCUMENT) ? m.content.substring(0, 3000) : "[Binary Data]",
+      // Provide structured data if available, otherwise fallback to truncated content
+      financialData: m.metadata.financial || null,
+      contentPreview: (m.type === RecallType.TEXT || m.type === RecallType.DOCUMENT) 
+          ? m.content.substring(0, 1000) // Lowered preview limit to allow more files in context
+          : "[Binary Data]",
       currentPos: { x: m.x, y: m.y }
     }));
 
@@ -289,18 +322,27 @@ export const runAgenticCommand = async (
 
     User Command: "${command}"
 
+    CAPABILITIES:
+    1. FINANCIAL ANALYST: You can calculate totals, averages, and forecast budgets based on the 'financialData' in the context.
+       - If the user asks "How much did I spend?", SUM the financialData.amount values from relevant files.
+       - You can create reports using 'createMemory'.
+    
+    2. GENERAL AGENT:
+       - EDIT: Use 'updateMemoryContent'.
+       - CREATE: Use 'createMemory' for summaries, extracted lists, code, or reports.
+       - ORGANIZE: Use 'organizeCanvas'.
+       - CHAT: Answer questions directly if no file change is needed.
+    
     RULES:
-    1. If the user wants to EDIT a file (e.g., "Add skill to resume", "Fix code"), find the matching ID and use 'updateMemoryContent'. 
-       You MUST generate the FULL content with the changes applied.
-    2. If the user wants to ORGANIZE (e.g., "Sort by type", "Cluster by mood"), use 'organizeCanvas'.
-    3. If it's a question, just answer.
+    - When doing math, BE PRECISE. Use the provided financialData.
+    - If creating a report, use Markdown tables.
     `;
 
     const response = await ai.models.generateContent({
       model: MODEL_FAST,
       contents: { parts: [{ text: systemPrompt }] },
       config: {
-        tools: [{ functionDeclarations: [toolUpdateMemory, toolOrganizeCanvas] }]
+        tools: [{ functionDeclarations: [toolUpdateMemory, toolCreateMemory, toolOrganizeCanvas] }]
       }
     });
 
@@ -311,6 +353,18 @@ export const runAgenticCommand = async (
       if (toolCall.name === 'updateMemoryContent') {
         const args = toolCall.args as any;
         return { type: 'update', id: args.id, content: args.newContent, reasoning: args.reasoning };
+      }
+      if (toolCall.name === 'createMemory') {
+        const args = toolCall.args as any;
+        return { 
+          type: 'create', 
+          title: args.title, 
+          memoryType: args.type, 
+          content: args.content, 
+          reasoning: args.reasoning,
+          sourceIds: args.sourceIds || [],
+          tags: args.tags || []
+        };
       }
       if (toolCall.name === 'organizeCanvas') {
         const args = toolCall.args as any;
