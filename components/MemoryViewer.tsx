@@ -1,6 +1,6 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { RecallFile, RecallType, SemanticDiff } from '../types';
-import { remixMemory, runAgenticCommand } from '../services/geminiService';
+import { remixMemory, runAgenticCommand, editSpecificSelection, editMemoryContent } from '../services/geminiService';
 
 interface MemoryViewerProps {
   memory: RecallFile;
@@ -8,19 +8,60 @@ interface MemoryViewerProps {
   onUpdate: (updatedMemory: RecallFile) => void;
 }
 
+interface SelectionState {
+  text: string;
+  start: number;
+  end: number;
+}
+
 export const MemoryViewer: React.FC<MemoryViewerProps> = ({ memory, onClose, onUpdate }) => {
   const [activeContent, setActiveContent] = useState(memory.content); 
   const [agentPrompt, setAgentPrompt] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
   const [historyIndex, setHistoryIndex] = useState(memory.history.length - 1);
+  const [selection, setSelection] = useState<SelectionState | null>(null);
+  
+  // New: Toggle between rendered view and raw source for Documents
+  const [viewSource, setViewSource] = useState(false);
 
   // Sync state when memory changes or time-travel happens
   useEffect(() => {
-    // If the memory object itself updates (e.g. from parent), reset to latest
-    // But if we are navigating history locally, we might not want this to reset unless the memory ID changes
     setActiveContent(memory.content);
     setHistoryIndex(memory.history.length - 1);
+    setSelection(null);
+    setViewSource(false); // Reset to preview mode on new file
   }, [memory.id, memory.updatedAt]);
+
+  const handleSelection = (e: React.SyntheticEvent<HTMLTextAreaElement | HTMLDivElement>) => {
+      // Logic for Textarea (Precise index tracking)
+      if (e.currentTarget instanceof HTMLTextAreaElement) {
+          const start = e.currentTarget.selectionStart;
+          const end = e.currentTarget.selectionEnd;
+          if (start !== end) {
+              const text = activeContent.substring(start, end);
+              setSelection({ start, end, text });
+          } else {
+              setSelection(null);
+          }
+      } 
+      // Fallback for HTML content (Approximation via window selection)
+      else {
+          const winSel = window.getSelection();
+          if (winSel && !winSel.isCollapsed) {
+              const text = winSel.toString();
+              if (text.length > 0) {
+                  // NOTE: This is an approximation for HTML views. It finds the first occurrence.
+                  // For precise editing, we prefer the Text View.
+                  const start = activeContent.indexOf(text);
+                  if (start !== -1) {
+                    setSelection({ start, end: start + text.length, text });
+                  }
+              }
+          } else {
+              setSelection(null);
+          }
+      }
+  };
 
   const handleAgentAction = async () => {
     if (!agentPrompt.trim()) return;
@@ -34,20 +75,22 @@ export const MemoryViewer: React.FC<MemoryViewerProps> = ({ memory, onClose, onU
         // Image Path: Use Remix
         newContent = await remixMemory(activeContent, agentPrompt);
         description = `Visual Remix: "${agentPrompt}"`;
+      } else if (selection) {
+        // --- SELECTION EDIT MODE ---
+        // Edit ONLY the highlighted chunk
+        const replacement = await editSpecificSelection(activeContent, selection.text, agentPrompt);
+        
+        // Splice the string
+        newContent = activeContent.substring(0, selection.start) + replacement + activeContent.substring(selection.end);
+        description = `Edited selection: "${agentPrompt}"`;
+        setSelection(null); // Clear selection after edit
       } else {
-        // Text/Doc Path: Use Agent
-        // We pass ONLY this memory to the agent to force it to focus on this file
-        const result = await runAgenticCommand(
-          `Edit this file: ${agentPrompt}. Content: ${activeContent}`, 
-          [{ ...memory, content: activeContent }]
-        );
-
-        if (result.type === 'update') {
-          newContent = result.content;
-          description = result.reasoning;
-        } else {
-          throw new Error("Agent did not return an update.");
-        }
+        // --- GLOBAL FILE MODE ---
+        // Use specialized editor function which guarantees a JSON response with content
+        const result = await editMemoryContent(activeContent, agentPrompt);
+        
+        newContent = result.content;
+        description = result.reasoning;
       }
       
       // Update State
@@ -69,7 +112,6 @@ export const MemoryViewer: React.FC<MemoryViewerProps> = ({ memory, onClose, onU
       };
 
       onUpdate(updatedMemory);
-      // activeContent will update via useEffect
       setAgentPrompt('');
       
     } catch (e) {
@@ -108,15 +150,16 @@ export const MemoryViewer: React.FC<MemoryViewerProps> = ({ memory, onClose, onU
       if (item.content) {
           setActiveContent(item.content);
           setHistoryIndex(idx);
+          setSelection(null);
       } else if (idx === 0 && !item.content && memory.history.length === 1) {
-          // Fallback for legacy files where initial content wasn't stored in history
-          // If it's the only item, we assume it matches memory.content
           setActiveContent(memory.content);
           setHistoryIndex(idx);
+          setSelection(null);
       }
   };
 
   const renderContent = () => {
+    // 1. Image Viewer
     if (memory.type === RecallType.IMAGE || memory.type === RecallType.HYBRID) {
       return (
         <img 
@@ -127,10 +170,10 @@ export const MemoryViewer: React.FC<MemoryViewerProps> = ({ memory, onClose, onU
       );
     } 
 
+    // 2. Document Viewer (PDF or HTML)
     if (memory.type === RecallType.DOCUMENT) {
-        // If content is Base64 (PDF) or starts with data:application/pdf
+        // PDF Handling (Always uses iframe)
         const isPdf = activeContent.startsWith('JVBER') || (memory.title.endsWith('.pdf'));
-        
         if (isPdf) {
             return (
                 <div className="w-full h-full bg-gray-900 rounded-lg overflow-hidden border border-white/10">
@@ -143,22 +186,52 @@ export const MemoryViewer: React.FC<MemoryViewerProps> = ({ memory, onClose, onU
             );
         }
 
-        // If content is HTML (DOCX parsed via Mammoth)
-        // We render it in a styled container that looks like a page
-        return (
-            <div className="w-full h-full bg-gray-200 text-gray-900 rounded-lg border border-white/10 p-8 overflow-auto shadow-inner">
-                <div 
-                    className="prose max-w-none"
-                    dangerouslySetInnerHTML={{ __html: activeContent }} 
-                />
-            </div>
-        );
+        // HTML (DOCX) Handling - PREVIEW MODE
+        // If not viewing source, show the formatted HTML
+        if (!viewSource) {
+            return (
+                <div className="relative w-full h-full flex flex-col">
+                     <button 
+                        onClick={() => setViewSource(true)}
+                        className="absolute top-2 right-2 z-10 bg-black/50 hover:bg-black/80 text-xs text-white px-3 py-1.5 rounded-lg backdrop-blur-md border border-white/10 transition-colors flex items-center gap-2"
+                     >
+                        <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4" /></svg>
+                        Edit Source
+                     </button>
+                    <div 
+                        className="w-full h-full bg-gray-200 text-gray-900 rounded-lg border border-white/10 p-8 overflow-auto shadow-inner selection:bg-cyan-300 selection:text-black"
+                        onMouseUp={handleSelection}
+                    >
+                        <div 
+                            className="prose max-w-none"
+                            dangerouslySetInnerHTML={{ __html: activeContent }} 
+                        />
+                    </div>
+                </div>
+            );
+        }
     }
     
-    // Text / Code / Markdown View
+    // 3. Text/Code Viewer OR Document Source Mode
+    // We use a readOnly TextArea to allow precise native selection
     return (
-        <div className="w-full h-full bg-gray-900 rounded-lg border border-white/10 p-6 overflow-auto shadow-inner">
-            <pre className="text-sm font-mono text-gray-300 whitespace-pre-wrap">{activeContent}</pre>
+        <div className="w-full h-full bg-gray-900 rounded-lg border border-white/10 p-1 overflow-hidden shadow-inner flex flex-col relative">
+             {memory.type === RecallType.DOCUMENT && (
+                 <button 
+                    onClick={() => setViewSource(false)}
+                    className="absolute top-2 right-4 z-10 bg-white/10 hover:bg-white/20 text-xs text-white px-3 py-1.5 rounded-lg backdrop-blur-md border border-white/10 transition-colors flex items-center gap-2"
+                 >
+                    <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>
+                    Preview
+                 </button>
+             )}
+            <textarea 
+                className="w-full h-full bg-transparent text-gray-300 font-mono text-sm p-6 resize-none focus:outline-none selection:bg-cyan-900 selection:text-white"
+                value={activeContent}
+                readOnly
+                onSelect={handleSelection} // Fires on selection change
+                spellCheck={false}
+            />
         </div>
     );
   };
@@ -193,18 +266,34 @@ export const MemoryViewer: React.FC<MemoryViewerProps> = ({ memory, onClose, onU
             </div>
             
             {/* Agent Input Bar */}
-            <div className="mt-4 w-full">
-                <div className={`glass-panel rounded-full p-2 flex items-center gap-2 ${!isCurrentVersion ? 'opacity-50 pointer-events-none grayscale' : ''}`}>
-                    <div className="w-8 h-8 rounded-full bg-gradient-to-tr from-cyan-500 to-blue-600 flex items-center justify-center">
-                        <svg className="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
-                        </svg>
+            <div className="mt-4 w-full relative">
+                {/* Selection Indicator */}
+                {selection && (
+                    <div className="absolute -top-10 left-0 bg-cyan-900/80 backdrop-blur-md border border-cyan-500/30 text-cyan-200 px-3 py-1.5 rounded-t-lg text-xs font-mono flex items-center gap-2 animate-in slide-in-from-bottom-2">
+                        <span className="w-2 h-2 bg-cyan-400 rounded-full animate-pulse" />
+                        <span className="font-bold">EDITING SELECTION:</span>
+                        <span className="opacity-70 truncate max-w-[200px]">"{selection.text}"</span>
+                        <button onClick={() => setSelection(null)} className="ml-2 hover:text-white">✕</button>
+                    </div>
+                )}
+
+                <div className={`glass-panel rounded-lg p-2 flex items-center gap-2 ${!isCurrentVersion ? 'opacity-50 pointer-events-none grayscale' : ''} ${selection ? 'rounded-tl-none border-t-cyan-500/50' : 'rounded-full'}`}>
+                    <div className={`w-8 h-8 rounded-full flex items-center justify-center transition-colors ${selection ? 'bg-cyan-500' : 'bg-gradient-to-tr from-cyan-500 to-blue-600'}`}>
+                        {selection ? (
+                             <svg className="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
+                             </svg>
+                        ) : (
+                            <svg className="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                            </svg>
+                        )}
                     </div>
                     <input 
                         type="text" 
                         value={agentPrompt}
                         onChange={(e) => setAgentPrompt(e.target.value)}
-                        placeholder={memory.type === RecallType.IMAGE ? "Remix this image..." : "Edit this file (e.g., 'Fix bugs', 'Add section')..."}
+                        placeholder={selection ? "How should I change the selected text?" : (memory.type === RecallType.IMAGE ? "Remix this image..." : "Edit this file...")}
                         className="bg-transparent border-none outline-none text-white text-sm px-2 flex-grow placeholder-white/30"
                         onKeyDown={(e) => e.key === 'Enter' && handleAgentAction()}
                     />
@@ -213,7 +302,7 @@ export const MemoryViewer: React.FC<MemoryViewerProps> = ({ memory, onClose, onU
                         disabled={isProcessing}
                         className="bg-white/10 hover:bg-white/20 text-white rounded-full px-4 py-2 text-xs font-bold transition-colors disabled:opacity-50 uppercase tracking-wider"
                     >
-                        {isProcessing ? 'Working...' : 'Execute'}
+                        {isProcessing ? 'Working...' : (selection ? 'Edit Selection' : 'Execute')}
                     </button>
                 </div>
             </div>

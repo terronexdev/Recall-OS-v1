@@ -117,6 +117,102 @@ export const remixMemory = async (
 };
 
 /**
+ * Edit Specific Text Selection
+ * This preserves the full context but returns only the replacement string.
+ */
+export const editSpecificSelection = async (
+  fullContext: string,
+  selection: string,
+  instruction: string
+): Promise<string> => {
+  try {
+    const prompt = `You are a precision text editor.
+    
+    FULL CONTEXT OF FILE:
+    """
+    ${fullContext}
+    """
+
+    USER HAS SELECTED THIS TEXT SEGMENT:
+    "${selection}"
+
+    INSTRUCTION: "${instruction}"
+
+    TASK:
+    Rewrite strictly the selected text segment based on the instruction.
+    Ensure the new text flows grammatically and contextually with the surrounding (unselected) text.
+    Return ONLY the new text string. Do not wrap in markdown or quotes.
+    `;
+
+    const response = await ai.models.generateContent({
+      model: MODEL_FAST,
+      contents: { parts: [{ text: prompt }] }
+    });
+
+    return response.text?.trim() || selection;
+  } catch (error) {
+    console.error("Selection Edit Failed", error);
+    throw error;
+  }
+};
+
+/**
+ * Edit Full File Content (Robust)
+ * Dedicated function for global file editing.
+ */
+export const editMemoryContent = async (
+  originalContent: string,
+  instruction: string
+): Promise<{ content: string, reasoning: string }> => {
+  try {
+    const prompt = `You are an intelligent text editor.
+    
+    ORIGINAL CONTENT:
+    """
+    ${originalContent}
+    """
+
+    INSTRUCTION: "${instruction}"
+
+    TASK:
+    1. Apply the instruction to the content.
+    2. Return the FULL updated content. Do not truncate.
+    3. Provide a short reasoning for the change.
+    
+    Output strictly JSON.
+    `;
+
+    const response = await ai.models.generateContent({
+      model: MODEL_FAST,
+      contents: { parts: [{ text: prompt }] },
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+                content: { type: Type.STRING, description: "The full updated content" },
+                reasoning: { type: Type.STRING, description: "Brief description of changes" }
+            },
+            required: ["content", "reasoning"]
+        }
+      }
+    });
+
+    const result = JSON.parse(response.text || "{}");
+    if (!result.content) throw new Error("AI failed to generate content");
+    
+    return {
+        content: result.content,
+        reasoning: result.reasoning || "Applied changes"
+    };
+
+  } catch (error) {
+    console.error("Edit Failed", error);
+    throw error;
+  }
+};
+
+/**
  * ---------------------------------------------------------
  * AGENTIC CORE
  * ---------------------------------------------------------
