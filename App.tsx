@@ -4,6 +4,7 @@ import { SpatialCanvas } from './components/SpatialCanvas';
 import { ingestRecall, runAgenticCommand } from './services/geminiService';
 import { RecallFile, RecallType, SemanticDiff } from './types';
 import mammoth from 'mammoth';
+import { read, utils } from 'xlsx';
 
 // --- Helper Functions ---
 const fileToBase64 = (file: File): Promise<string> => {
@@ -72,7 +73,12 @@ export default function App() {
   useEffect(() => {
     const saved = localStorage.getItem('recall_memories');
     if (saved) {
-      setMemories(JSON.parse(saved));
+      try {
+        setMemories(JSON.parse(saved));
+      } catch (e) {
+        console.error("Failed to parse memories", e);
+        handleReset();
+      }
     } else {
       // Seed Data
       setMemories([{
@@ -97,6 +103,13 @@ export default function App() {
   }, [memories]);
 
   // --- Actions ---
+
+  const handleReset = () => {
+    if (window.confirm("WARNING: This will wipe all current memory files and reset the OS. Are you sure?")) {
+        localStorage.removeItem('recall_memories');
+        window.location.reload();
+    }
+  };
 
   const handleUpdateMemoryPosition = (id: string, x: number, y: number) => {
     setMemories(prev => prev.map(m => m.id === id ? { ...m, x, y } : m));
@@ -155,22 +168,43 @@ export default function App() {
           let content = '';
           const mimeType = file.type || 'application/octet-stream';
           const isDocx = file.name.endsWith('.docx');
+          const isExcel = file.name.endsWith('.xlsx') || file.name.endsWith('.xls');
           const isText = mimeType.startsWith('text/') || file.name.endsWith('.md') || file.name.endsWith('.ts');
           
           if (isDocx) {
              const buf = await file.arrayBuffer();
              const res = await mammoth.convertToHtml({ arrayBuffer: buf });
              content = res.value;
+          } else if (isExcel) {
+             const buf = await file.arrayBuffer();
+             const workbook = read(buf, { type: 'array' });
+             
+             // Extract ALL sheets
+             const sheetsData = workbook.SheetNames.map(name => ({
+                 name: name,
+                 html: utils.sheet_to_html(workbook.Sheets[name])
+             }));
+
+             // Store as a structured JSON string to differentiate from single HTML strings
+             content = JSON.stringify({ 
+                 appType: 'spreadsheet', 
+                 sheets: sheetsData 
+             });
+
           } else if (isText) {
              content = await fileToText(file);
           } else {
              content = await fileToBase64(file);
           }
           
-          const analysis = await ingestRecall(content, isDocx ? 'text/html' : mimeType, file.name);
+          // If Excel or Docx, we tell ingestRecall it is HTML so it processes it as text data
+          // For Excel now, we are sending a JSON string, but we can treat it as 'text/plain' or 'application/json' for the AI ingestion to read context
+          const ingestMime = (isDocx) ? 'text/html' : (isExcel ? 'application/json' : mimeType);
+          
+          const analysis = await ingestRecall(content, ingestMime, file.name);
           
           // Determine Type strictly for positioning
-          const type = isDocx ? RecallType.DOCUMENT : (analysis.type || RecallType.DOCUMENT);
+          const type = (isDocx || isExcel) ? RecallType.DOCUMENT : (analysis.type || RecallType.DOCUMENT);
           
           // Calculate Smart Position
           // We pass [current + batch] to ensure files dropped together clump together
@@ -214,6 +248,13 @@ export default function App() {
 
   const handleCommand = async () => {
       if (!searchQuery.trim()) return;
+
+      // System Commands
+      if (searchQuery.trim() === '/reset' || searchQuery.trim() === 'system reset') {
+        handleReset();
+        return;
+      }
+
       setIsProcessing(true);
       setStatus("Agent Thinking...");
       
@@ -323,6 +364,18 @@ export default function App() {
             onDeleteMemory={handleDeleteMemory}
         />
 
+        {/* Factory Reset UI */}
+        <button 
+            onClick={handleReset}
+            className="fixed top-4 right-4 z-40 text-red-500/50 hover:text-red-500 bg-transparent hover:bg-red-500/10 p-2 rounded-full transition-all border border-transparent hover:border-red-500/30 group"
+            title="RESET OS (Wipe Data)"
+        >
+             <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+             </svg>
+             <span className="absolute right-full mr-2 top-1/2 -translate-y-1/2 text-xs font-mono text-red-500 opacity-0 group-hover:opacity-100 whitespace-nowrap">RESET OS</span>
+        </button>
+
         {/* 2. Spotlight Command Bar (Floating) */}
         <div className="fixed top-8 left-1/2 -translate-x-1/2 w-full max-w-xl z-50 px-4">
             <div className="glass-pill rounded-full flex items-center p-1 pr-4 shadow-2xl transition-all focus-within:ring-2 focus-within:ring-cyan-500/30 ring-1 ring-white/10">
@@ -363,6 +416,10 @@ export default function App() {
                 onUpdate={(updated) => {
                     setMemories(prev => prev.map(m => m.id === updated.id ? updated : m));
                     setActiveMemory(updated);
+                }}
+                onDelete={(id) => {
+                    handleDeleteMemory(id);
+                    setActiveMemory(null);
                 }}
             />
         )}
