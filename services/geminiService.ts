@@ -5,7 +5,7 @@ import { RecallFile, RecallType } from "../types";
 const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
 // Models
-const MODEL_FAST = 'gemini-3-flash-preview'; // Upgraded to latest for better reasoning
+const MODEL_FAST = 'gemini-3-flash-preview'; 
 const MODEL_IMAGE = 'gemini-2.5-flash-image'; 
 
 /**
@@ -21,15 +21,14 @@ const simplifySpreadsheetForAI = (content: string): string => {
     let summary = "SPREADSHEET DATA (Multiple Tabs):\n";
     data.sheets.forEach((sheet: any) => {
       summary += `\n--- SHEET: ${sheet.name} ---\n`;
-      // Very simple HTML to text conversion for tables
       const text = sheet.html
-        .replace(/<\/tr>/g, '\n') // New line for rows
-        .replace(/<\/td>/g, ' | ') // Separator for cells
-        .replace(/<[^>]+>/g, '')  // Strip all other tags
-        .replace(/\s+/g, ' ')     // Collapse whitespace
+        .replace(/<\/tr>/g, '\n')
+        .replace(/<\/td>/g, ' | ')
+        .replace(/<[^>]+>/g, '')
+        .replace(/\s+/g, ' ')
         .trim();
       
-      summary += text.substring(0, 3000); // Take a large chunk of each sheet
+      summary += text.substring(0, 3000);
     });
     return summary;
   } catch (e) {
@@ -60,46 +59,50 @@ export const ingestRecall = async (
     Generate a JSON object with:
     1. 'title': A professional title.
     2. 'description': A deep summary of key findings, figures, and purposes.
-    3. 'tags': 5-8 semantic tags (categories, projects, entities).
+    3. 'tags': 5-8 semantic tags.
     4. 'mood': Professional tone.
-    5. 'financial': {
-         "amount": number | null (Extract the most prominent Total Budget or Grand Total),
-         "currency": "USD",
-         "date": string | null,
-         "category": string,
-         "entity": string (The main project or vendor)
-       }
+    5. 'financial': { "amount": number | null, "currency": "USD", "category": string, "entity": string }
     `;
 
     const contents = [];
-
     if (isSupportedBinary) {
-      contents.push({
-        inlineData: {
-          mimeType: mimeType,
-          data: data
-        }
-      });
+      contents.push({ inlineData: { mimeType, data } });
     } else if (isSpreadsheet) {
-      // Send the AI a cleaned text version of the spreadsheet to help it build the summary
       contents.push({ text: `SPREADSHEET CONTENT (Parsed):\n${simplifySpreadsheetForAI(data)}` });
     } else if (isText) {
       contents.push({ text: `FILE CONTENT:\n${data}` });
     }
-    
     contents.push({ text: prompt });
 
     const response: GenerateContentResponse = await ai.models.generateContent({
       model: MODEL_FAST,
       contents: { parts: contents },
-      config: { responseMimeType: "application/json" }
+      config: { 
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            title: { type: Type.STRING },
+            description: { type: Type.STRING },
+            tags: { type: Type.ARRAY, items: { type: Type.STRING } },
+            mood: { type: Type.STRING },
+            financial: {
+              type: Type.OBJECT,
+              properties: {
+                amount: { type: Type.NUMBER },
+                currency: { type: Type.STRING },
+                category: { type: Type.STRING },
+                entity: { type: Type.STRING }
+              },
+              required: ["category", "entity"]
+            }
+          },
+          required: ["title", "description", "tags"]
+        }
+      }
     });
 
-    const text = response.text;
-    if (!text) throw new Error("No response from Gemini");
-
-    const analysis = JSON.parse(text);
-
+    const analysis = JSON.parse(response.text || "{}");
     let type = RecallType.DOCUMENT;
     if (isImage) type = RecallType.IMAGE;
     else if (isVideo) type = RecallType.VIDEO;
@@ -113,82 +116,38 @@ export const ingestRecall = async (
       metadata: {
         tags: analysis.tags || [],
         mood: analysis.mood || "neutral",
-        location: "Unknown",
-        sourceApp: isSpreadsheet ? "Spreadsheet Engine" : "Drag & Drop",
+        sourceApp: isSpreadsheet ? "Spreadsheet Engine" : "Recall Core",
         financial: analysis.financial || {}
       }
     };
-
   } catch (error) {
     console.error("Ingestion failed", error);
-    return {
-        title: filename,
-        description: "Imported file.",
-        type: RecallType.DOCUMENT,
-        metadata: { tags: ['file'], mood: 'neutral' }
-    };
+    return { title: filename, type: RecallType.DOCUMENT, metadata: { tags: ['file'], mood: 'neutral' } };
   }
 };
 
 /**
  * Image Remixing
  */
-export const remixMemory = async (
-  originalImageBase64: string,
-  instruction: string
-): Promise<string> => {
+export const remixMemory = async (originalImageBase64: string, instruction: string): Promise<string> => {
   try {
     const response = await ai.models.generateContent({
       model: MODEL_IMAGE,
       contents: {
         parts: [
           { inlineData: { mimeType: "image/jpeg", data: originalImageBase64 } },
-          { text: `Transform this image based strictly on this instruction: ${instruction}. Maintain composition.` }
+          { text: `Transform this image based strictly on this instruction: ${instruction}. Maintain original composition.` }
         ]
       }
     });
-    return response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data || "";
-  } catch (error) {
-    console.error("Remix failed", error);
-    throw error;
-  }
-};
-
-/**
- * Edit Specific Text Selection
- */
-export const editSpecificSelection = async (
-  fullContext: string,
-  selection: string,
-  instruction: string
-): Promise<string> => {
-  try {
-    const prompt = `You are a precision text editor.
-    
-    FULL CONTEXT:
-    """
-    ${fullContext}
-    """
-
-    USER SELECTION:
-    "${selection}"
-
-    INSTRUCTION: "${instruction}"
-
-    TASK:
-    Rewrite strictly the selected text segment. Return ONLY the new string.
-    `;
-
-    const response = await ai.models.generateContent({
-      model: MODEL_FAST,
-      contents: { parts: [{ text: prompt }] }
-    });
-
-    return response.text?.trim() || selection;
-  } catch (error) {
-    console.error("Selection Edit Failed", error);
-    throw error;
-  }
+    let base64Result = "";
+    if (response.candidates?.[0]?.content?.parts) {
+      for (const part of response.candidates[0].content.parts) {
+        if (part.inlineData) { base64Result = part.inlineData.data; break; }
+      }
+    }
+    return base64Result;
+  } catch (error) { throw error; }
 };
 
 /**
@@ -207,7 +166,7 @@ export const editMemoryContent = async (
     Output strictly JSON with {content, reasoning}.
     `;
 
-    const response = await ai.models.generateContent({
+    const response: GenerateContentResponse = await ai.models.generateContent({
       model: MODEL_FAST,
       contents: { parts: [{ text: prompt }] },
       config: {
@@ -224,131 +183,38 @@ export const editMemoryContent = async (
     });
 
     const result = JSON.parse(response.text || "{}");
-    return {
-        content: result.content,
-        reasoning: result.reasoning || "Applied changes"
-    };
-  } catch (error) {
-    console.error("Edit Failed", error);
-    throw error;
-  }
-};
-
-/**
- * ---------------------------------------------------------
- * AGENTIC CORE
- * ---------------------------------------------------------
- */
-
-const toolUpdateMemory: FunctionDeclaration = {
-  name: "updateMemoryContent",
-  description: "Update text content of a memory. Use for editing documents or fixing data.",
-  parameters: {
-    type: Type.OBJECT,
-    properties: {
-      id: { type: Type.STRING },
-      newContent: { type: Type.STRING },
-      reasoning: { type: Type.STRING }
-    },
-    required: ["id", "newContent", "reasoning"]
-  }
-};
-
-const toolCreateMemory: FunctionDeclaration = {
-  name: "createMemory",
-  description: "Create a NEW memory report or summary based on existing data.",
-  parameters: {
-    type: Type.OBJECT,
-    properties: {
-      title: { type: Type.STRING },
-      type: { type: Type.STRING, enum: ["TEXT", "DOCUMENT", "IMAGE"] },
-      content: { type: Type.STRING },
-      reasoning: { type: Type.STRING },
-      sourceIds: { type: Type.ARRAY, items: { type: Type.STRING } },
-      tags: { type: Type.ARRAY, items: { type: Type.STRING } }
-    },
-    required: ["title", "type", "content", "reasoning"]
-  }
-};
-
-const toolOrganizeCanvas: FunctionDeclaration = {
-  name: "organizeCanvas",
-  description: "Arrange memory clusters visually on the canvas.",
-  parameters: {
-    type: Type.OBJECT,
-    properties: {
-      layout: {
-        type: Type.ARRAY,
-        items: {
-          type: Type.OBJECT,
-          properties: {
-            id: { type: Type.STRING },
-            x: { type: Type.NUMBER },
-            y: { type: Type.NUMBER }
-          },
-          required: ["id", "x", "y"]
-        }
-      },
-      reasoning: { type: Type.STRING }
-    },
-    required: ["layout", "reasoning"]
-  }
+    return { content: result.content, reasoning: result.reasoning || "Applied changes" };
+  } catch (error) { throw error; }
 };
 
 export type AgentResponse = 
   | { type: 'chat', message: string }
   | { type: 'update', id: string, content: string, reasoning: string }
-  | { type: 'create', title: string, memoryType: string, content: string, reasoning: string, sourceIds: string[], tags: string[] }
-  | { type: 'move', layout: {id: string, x: number, y: number}[], reasoning: string };
+  | { type: 'create', title: string, memoryType: string, content: string, reasoning: string, sourceIds: string[], tags: string[] };
 
-export const runAgenticCommand = async (
-  command: string, 
-  memories: RecallFile[]
-): Promise<AgentResponse> => {
+export const runAgenticCommand = async (command: string, memories: RecallFile[]): Promise<AgentResponse> => {
   try {
-    // PREPARE INTELLIGENT CONTEXT
-    const context = memories.map(m => {
-      // Logic: If it's a spreadsheet, we must parse the tabs into a text summary 
-      // so the model can actually see the data rows instead of just JSON metadata.
-      const simplifiedContent = (m.type === RecallType.TEXT || m.type === RecallType.DOCUMENT)
-        ? simplifySpreadsheetForAI(m.content)
-        : "[Non-Textual Data]";
+    const context = memories.map(m => ({
+      id: m.id,
+      title: m.title,
+      type: m.type,
+      tags: m.metadata.tags,
+      dataPreview: (m.type === RecallType.TEXT || m.type === RecallType.DOCUMENT) ? m.content.substring(0, 1000) : "[Non-Textual]"
+    }));
 
-      return {
-        id: m.id,
-        title: m.title,
-        type: m.type,
-        tags: m.metadata.tags,
-        financialSummary: m.metadata.financial || null,
-        dataPreview: simplifiedContent, // This now contains cleaned multi-tab text
-        currentPos: { x: m.x, y: m.y }
-      };
-    });
-
-    const systemPrompt = `You are the Recall OS Agent. You have access to the user's memory core.
-    
+    const systemPrompt = `You are the Recall OS Agent. You help users manage their memories.
     SYSTEM STATE:
     ${JSON.stringify(context)}
-
-    USER COMMAND: "${command}"
-
-    SPECIFIC INSTRUCTIONS FOR SPREADSHEETS:
-    - Many memories are 'Spreadsheets'. These contain multiple tabs (e.g., 'Parcel Master', 'Financial Tracker').
-    - When asked about budget specifics, parcel counts, or project status, look deep into the 'dataPreview' provided for those files.
-    - If a user asks for a cross-project summary, aggregate data from all relevant memories.
-    - BE PRECISE. Use the specific dollar amounts and parcel IDs found in the data rows.
-
-    CAPABILITIES:
-    1. ANALYST: Sum budgets, calculate averages, list specific high-risk parcels.
-    2. ARCHITECT: Cluster files by project name or status using 'organizeCanvas'.
-    3. CREATOR: Generate new 'TEXT' or 'DOCUMENT' reports summarizing findings.
-    `;
+    USER COMMAND: "${command}"`;
 
     const response = await ai.models.generateContent({
       model: MODEL_FAST,
       contents: { parts: [{ text: systemPrompt }] },
       config: {
-        tools: [{ functionDeclarations: [toolUpdateMemory, toolCreateMemory, toolOrganizeCanvas] }]
+        tools: [{ functionDeclarations: [
+          { name: "updateMemoryContent", parameters: { type: Type.OBJECT, properties: { id: { type: Type.STRING }, newContent: { type: Type.STRING }, reasoning: { type: Type.STRING } } } },
+          { name: "createMemory", parameters: { type: Type.OBJECT, properties: { title: { type: Type.STRING }, type: { type: Type.STRING }, content: { type: Type.STRING }, reasoning: { type: Type.STRING } } } }
+        ] }]
       }
     });
 
@@ -356,32 +222,11 @@ export const runAgenticCommand = async (
     const toolCall = candidate?.content?.parts?.find(p => p.functionCall)?.functionCall;
 
     if (toolCall) {
-      if (toolCall.name === 'updateMemoryContent') {
-        const args = toolCall.args as any;
-        return { type: 'update', id: args.id, content: args.newContent, reasoning: args.reasoning };
-      }
-      if (toolCall.name === 'createMemory') {
-        const args = toolCall.args as any;
-        return { 
-          type: 'create', 
-          title: args.title, 
-          memoryType: args.type, 
-          content: args.content, 
-          reasoning: args.reasoning,
-          sourceIds: args.sourceIds || [],
-          tags: args.tags || []
-        };
-      }
-      if (toolCall.name === 'organizeCanvas') {
-        const args = toolCall.args as any;
-        return { type: 'move', layout: args.layout, reasoning: args.reasoning };
-      }
+      const args = toolCall.args as any;
+      if (toolCall.name === 'updateMemoryContent') return { type: 'update', id: args.id, content: args.newContent, reasoning: args.reasoning };
+      if (toolCall.name === 'createMemory') return { type: 'create', title: args.title, memoryType: args.type, content: args.content, reasoning: args.reasoning, sourceIds: [], tags: [] };
     }
 
-    return { type: 'chat', message: response.text || "I've analyzed the data but no action was required." };
-
-  } catch (error) {
-    console.error("Agent Error:", error);
-    return { type: 'chat', message: "Agent failed to connect to neural core." };
-  }
+    return { type: 'chat', message: response.text || "I'm standing by." };
+  } catch (error) { return { type: 'chat', message: "Neural link offline." }; }
 };

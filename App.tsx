@@ -1,73 +1,27 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { MemoryViewer } from './components/MemoryViewer';
 import { SpatialCanvas } from './components/SpatialCanvas';
+import { LibraryPanel } from './components/LibraryPanel';
+import { AgentPanel } from './components/AgentPanel';
 import { ingestRecall, runAgenticCommand } from './services/geminiService';
-import { RecallFile, RecallType, SemanticDiff } from './types';
+import { RecallFile, RecallType, ChatMessage } from './types';
 import mammoth from 'mammoth';
 import { read, utils } from 'xlsx';
-
-// --- Helper Functions ---
-const fileToBase64 = (file: File): Promise<string> => {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.readAsDataURL(file);
-    reader.onload = () => resolve((reader.result as string).split(',')[1]); 
-    reader.onerror = error => reject(error);
-  });
-};
-
-const fileToText = (file: File): Promise<string> => {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.readAsText(file);
-    reader.onload = () => resolve(reader.result as string);
-    reader.onerror = error => reject(error);
-  });
-};
-
-// --- Smart Positioning Logic ---
-const getSmartPosition = (type: RecallType, currentMemories: RecallFile[]) => {
-  const peers = currentMemories.filter(m => m.type === type);
-  const jitter = () => (Math.random() * 120) - 60; // +/- 60px spread
-
-  // 1. If peers exist, cluster around their center of gravity
-  if (peers.length > 0) {
-    const sumX = peers.reduce((acc, m) => acc + (m.x || 0), 0);
-    const sumY = peers.reduce((acc, m) => acc + (m.y || 0), 0);
-    const avgX = sumX / peers.length;
-    const avgY = sumY / peers.length;
-
-    return {
-      x: avgX + jitter(),
-      y: avgY + jitter()
-    };
-  }
-
-  // 2. If no peers, snap to Archetype Anchors (zones)
-  // Assumes a virtual canvas center around 500, 400
-  switch (type) {
-    case RecallType.IMAGE:
-    case RecallType.HYBRID:
-      return { x: 900 + jitter(), y: 200 + jitter() }; // Top Right (Gallery)
-    case RecallType.DOCUMENT:
-      return { x: 200 + jitter(), y: 200 + jitter() }; // Top Left (Filing Cabinet)
-    case RecallType.AUDIO:
-    case RecallType.VIDEO:
-      return { x: 200 + jitter(), y: 700 + jitter() }; // Bottom Left (AV Studio)
-    case RecallType.TEXT:
-    default:
-      return { x: 600 + jitter(), y: 500 + jitter() }; // Center (Workbench)
-  }
-};
 
 export default function App() {
   // --- Global State ---
   const [memories, setMemories] = useState<RecallFile[]>([]);
   const [activeMemory, setActiveMemory] = useState<RecallFile | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
-  const [status, setStatus] = useState("System Ready");
+  const [status, setStatus] = useState("Ready");
   const [isDraggingFile, setIsDraggingFile] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
+  
+  // UI States
+  const [viewMode, setViewMode] = useState<'canvas' | 'focus'>('canvas');
+  const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
+  const [filterTag, setFilterTag] = useState<string | null>(null);
+  const [sortBy, setSortBy] = useState<'date' | 'name' | 'type'>('date');
 
   // --- Persistence ---
   useEffect(() => {
@@ -76,25 +30,8 @@ export default function App() {
       try {
         setMemories(JSON.parse(saved));
       } catch (e) {
-        console.error("Failed to parse memories", e);
-        handleReset();
+        localStorage.removeItem('recall_memories');
       }
-    } else {
-      // Seed Data
-      setMemories([{
-          id: '1',
-          title: 'Welcome to Recall',
-          description: 'System initialization manifest.',
-          type: RecallType.TEXT,
-          content: 'Welcome to Recall OS v2.0.\n\nSpatial interface active.\nNeural core online.',
-          thumbnail: '',
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
-          metadata: { tags: ['system', 'welcome'], mood: 'neutral' },
-          history: [],
-          x: 600,
-          y: 400
-      }]);
     }
   }, []);
 
@@ -102,74 +39,39 @@ export default function App() {
     localStorage.setItem('recall_memories', JSON.stringify(memories));
   }, [memories]);
 
-  // --- Actions ---
+  // --- Logic ---
+  const filteredMemories = useMemo(() => {
+      let filtered = memories.filter(m => 
+        m.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
+        m.metadata.tags.some(t => t.toLowerCase().includes(searchQuery.toLowerCase()))
+      );
 
-  const handleReset = () => {
-    if (window.confirm("WARNING: This will wipe all current memory files and reset the OS. Are you sure?")) {
-        localStorage.removeItem('recall_memories');
-        window.location.reload();
-    }
-  };
+      if (filterTag) {
+          filtered = filtered.filter(m => m.metadata.tags.includes(filterTag));
+      }
 
-  const handleUpdateMemoryPosition = (id: string, x: number, y: number) => {
-    setMemories(prev => prev.map(m => m.id === id ? { ...m, x, y } : m));
-  };
-
-  const handleDeleteMemory = (id: string) => {
-      setMemories(prev => prev.filter(m => m.id !== id));
-      setStatus("Memory Deleted");
-  };
-
-  // --- Robust Drag & Drop Handling ---
-
-  const handleDragEnter = (e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDraggingFile(true);
-  };
-
-  const handleDragOver = (e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    // Explicitly confirm this is a copy operation to the browser
-    e.dataTransfer.dropEffect = 'copy';
-    if (!isDraggingFile) setIsDraggingFile(true);
-  };
-
-  const handleDragLeave = (e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    
-    // Crucial: Only turn off if we are actually leaving the window/container
-    // If we are just entering a child element (relatedTarget), do nothing.
-    if (e.relatedTarget && e.currentTarget.contains(e.relatedTarget as Node)) {
-        return;
-    }
-    
-    setIsDraggingFile(false);
-  };
+      return [...filtered].sort((a, b) => {
+          if (sortBy === 'name') return a.title.localeCompare(b.title);
+          if (sortBy === 'type') return a.type.localeCompare(b.type);
+          return b.updatedAt - a.updatedAt;
+      });
+  }, [memories, searchQuery, filterTag, sortBy]);
 
   const handleDrop = async (e: React.DragEvent) => {
     e.preventDefault();
-    e.stopPropagation();
     setIsDraggingFile(false);
-    
     const files = Array.from(e.dataTransfer.files) as File[];
     if (files.length === 0) return;
 
     setStatus("Ingesting Material...");
-    
-    // Create a local copy of memories to calculate positions for the batch
-    const newMemoriesBatch: RecallFile[] = [];
-    const currentMemoryState = [...memories]; 
-
     for (const file of files) {
         try {
           let content = '';
-          const mimeType = file.type || 'application/octet-stream';
-          const isDocx = file.name.endsWith('.docx');
-          const isExcel = file.name.endsWith('.xlsx') || file.name.endsWith('.xls');
-          const isText = mimeType.startsWith('text/') || file.name.endsWith('.md') || file.name.endsWith('.ts');
+          const fileName = file.name.toLowerCase();
+          const isDocx = fileName.endsWith('.docx');
+          const isExcel = fileName.endsWith('.xlsx') || fileName.endsWith('.xls') || fileName.endsWith('.csv');
+          const isImage = file.type.startsWith('image/');
+          const isPdf = fileName.endsWith('.pdf') || file.type === 'application/pdf';
           
           if (isDocx) {
              const buf = await file.arrayBuffer();
@@ -179,249 +81,176 @@ export default function App() {
              const buf = await file.arrayBuffer();
              const workbook = read(buf, { type: 'array' });
              
-             // Extract ALL sheets
              const sheetsData = workbook.SheetNames.map(name => ({
                  name: name,
                  html: utils.sheet_to_html(workbook.Sheets[name])
              }));
 
-             // Store as a structured JSON string to differentiate from single HTML strings
              content = JSON.stringify({ 
                  appType: 'spreadsheet', 
                  sheets: sheetsData 
              });
-
-          } else if (isText) {
-             content = await fileToText(file);
+          } else if (isImage || isPdf || file.type.startsWith('video/') || file.type.startsWith('audio/')) {
+             const reader = new FileReader();
+             content = await new Promise((resolve) => {
+                 reader.onload = () => {
+                     const res = reader.result as string;
+                     resolve(res.split(',')[1]); // Extract Base64
+                 };
+                 reader.readAsDataURL(file);
+             });
           } else {
-             content = await fileToBase64(file);
+             const reader = new FileReader();
+             content = await new Promise((resolve) => {
+                 reader.onload = () => resolve(reader.result as string);
+                 reader.readAsText(file);
+             });
           }
           
-          // If Excel or Docx, we tell ingestRecall it is HTML so it processes it as text data
-          // For Excel now, we are sending a JSON string, but we can treat it as 'text/plain' or 'application/json' for the AI ingestion to read context
-          const ingestMime = (isDocx) ? 'text/html' : (isExcel ? 'application/json' : mimeType);
+          const analysis = await ingestRecall(content, file.type || 'text/plain', file.name);
           
-          const analysis = await ingestRecall(content, ingestMime, file.name);
-          
-          // Determine Type strictly for positioning
-          const type = (isDocx || isExcel) ? RecallType.DOCUMENT : (analysis.type || RecallType.DOCUMENT);
-          
-          // Calculate Smart Position
-          // We pass [current + batch] to ensure files dropped together clump together
-          const pos = getSmartPosition(type, [...currentMemoryState, ...newMemoriesBatch]);
-          
+          // Strict Type Mapping to avoid UI rendering bugs
+          let finalType = RecallType.DOCUMENT;
+          if (isImage) finalType = RecallType.IMAGE;
+          else if (file.type.startsWith('video/')) finalType = RecallType.VIDEO;
+          else if (file.type.startsWith('audio/')) finalType = RecallType.AUDIO;
+          else if (!isPdf && !isExcel && analysis.type) finalType = analysis.type as RecallType;
+
           const newMemory: RecallFile = {
             id: crypto.randomUUID(),
             title: analysis.title || file.name,
             description: analysis.description || '',
-            type: type,
+            type: finalType,
             content: content,
-            thumbnail: (analysis.type === RecallType.IMAGE) ? content : '', 
+            thumbnail: (finalType === RecallType.IMAGE) ? content : '',
             createdAt: Date.now(),
             updatedAt: Date.now(),
             metadata: analysis.metadata as any,
             history: [{
                 id: crypto.randomUUID(),
                 timestamp: Date.now(),
-                description: 'Original Import',
+                description: 'Initial Recall State',
                 author: 'user',
                 content: content
             }],
-            x: pos.x, 
-            y: pos.y
+            x: Math.random() * 800, 
+            y: Math.random() * 600
           };
-          
-          newMemoriesBatch.push(newMemory);
-        } catch (err) {
-          console.error("Ingestion Error for file:", file.name, err);
-          setStatus(`Error reading ${file.name}`);
+          setMemories(prev => [newMemory, ...prev]);
+        } catch (err) { 
+          console.error("Ingestion error:", err);
         }
     }
-    
-    if (newMemoriesBatch.length > 0) {
-        setMemories(prev => [...newMemoriesBatch, ...prev]);
-        setStatus("System Ready");
-    } else {
-        setStatus("Import Failed or Empty");
-    }
+    setStatus("Ready");
   };
 
-  const handleCommand = async () => {
-      if (!searchQuery.trim()) return;
-
-      // System Commands
-      if (searchQuery.trim() === '/reset' || searchQuery.trim() === 'system reset') {
-        handleReset();
-        return;
-      }
-
-      setIsProcessing(true);
-      setStatus("Agent Thinking...");
-      
-      const result = await runAgenticCommand(searchQuery, memories);
-      
-      if (result.type === 'move') {
-          // Animate movement
-          setMemories(prev => prev.map(m => {
-              const target = result.layout.find(l => l.id === m.id);
-              return target ? { ...m, x: target.x, y: target.y } : m;
-          }));
-          setStatus(result.reasoning);
-      } else if (result.type === 'update') {
-          // Handle specific file update
-          setMemories(prev => prev.map(m => {
-              if (m.id === result.id) {
-                  return {
-                      ...m,
-                      content: result.content,
-                      updatedAt: Date.now(),
-                      history: [...m.history, {
-                          id: crypto.randomUUID(),
-                          timestamp: Date.now(),
-                          description: result.reasoning,
-                          content: result.content,
-                          author: 'gemini'
-                      }]
-                  };
-              }
-              return m;
-          }));
-          setStatus(result.reasoning);
-      } else if (result.type === 'create') {
-          // --- HANDLE GENERATIVE CREATION ---
-          
-          // 1. Calculate Position: Center of sources OR Center of screen
-          let targetX = 600;
-          let targetY = 400;
-          
-          if (result.sourceIds && result.sourceIds.length > 0) {
-              const sources = memories.filter(m => result.sourceIds.includes(m.id));
-              if (sources.length > 0) {
-                  const avgX = sources.reduce((sum, m) => sum + (m.x || 0), 0) / sources.length;
-                  const avgY = sources.reduce((sum, m) => sum + (m.y || 0), 0) / sources.length;
-                  targetX = avgX + 100; // Offset slightly
-                  targetY = avgY + 50;
-              }
-          }
-
-          const newType = result.memoryType as RecallType || RecallType.TEXT;
-
-          const newMemory: RecallFile = {
-              id: crypto.randomUUID(),
-              title: result.title,
-              description: result.reasoning,
-              type: newType,
-              content: result.content,
-              thumbnail: (newType === RecallType.IMAGE) ? result.content : '',
-              createdAt: Date.now(),
-              updatedAt: Date.now(),
-              metadata: {
-                  tags: result.tags || ['agent-created'],
-                  mood: 'neutral',
-                  sourceApp: 'Gemini Agent'
-              },
-              history: [{
-                  id: crypto.randomUUID(),
-                  timestamp: Date.now(),
-                  description: 'Created by Agent',
-                  author: 'gemini',
-                  content: result.content
-              }],
-              x: targetX,
-              y: targetY
-          };
-          
-          setMemories(prev => [...prev, newMemory]);
-          setStatus(result.reasoning);
-
-      } else {
-          setStatus(result.message);
-      }
-      
-      setIsProcessing(false);
-      setSearchQuery('');
+  const handleAgentCommand = async (input: string) => {
+    if (!input.trim()) return;
+    setIsProcessing(true);
+    setChatHistory(prev => [...prev, { role: 'user', text: input, timestamp: Date.now() }]);
+    
+    const result = await runAgenticCommand(input, memories);
+    
+    if (result.type === 'chat') {
+        setChatHistory(prev => [...prev, { role: 'model', text: result.message, timestamp: Date.now() }]);
+    } else if (result.type === 'create') {
+        setChatHistory(prev => [...prev, { role: 'model', text: `Memory Generated: ${result.title}`, timestamp: Date.now() }]);
+        const newMem: RecallFile = {
+            id: crypto.randomUUID(),
+            title: result.title,
+            description: result.reasoning,
+            type: result.memoryType as RecallType,
+            content: result.content,
+            thumbnail: (result.memoryType === 'IMAGE') ? result.content : '',
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            metadata: { tags: result.tags || ['agent-created'], mood: 'neutral', sourceApp: 'Agent Core' },
+            history: [{ id: crypto.randomUUID(), timestamp: Date.now(), description: 'Generated by Agent', author: 'gemini', content: result.content }],
+            x: 600, y: 400
+        };
+        setMemories(p => [newMem, ...p]);
+    }
+    setIsProcessing(false);
   };
 
   return (
     <div 
-        className="w-screen h-screen bg-[#050505] text-white overflow-hidden relative"
-        onDragEnter={handleDragEnter}
-        onDragOver={handleDragOver}
-        onDragLeave={handleDragLeave}
+        className="w-screen h-screen bg-[#050505] text-white overflow-hidden flex"
+        onDragOver={(e) => { e.preventDefault(); setIsDraggingFile(true); }}
+        onDragLeave={() => setIsDraggingFile(false)}
         onDrop={handleDrop}
     >
-        {/* Background Ambient Glow */}
-        <div className="absolute inset-0 pointer-events-none">
-            <div className="absolute top-[-20%] left-[20%] w-[800px] h-[800px] bg-purple-900/10 rounded-full blur-[120px] animate-pulse" />
-            <div className="absolute bottom-[-20%] right-[20%] w-[600px] h-[600px] bg-cyan-900/10 rounded-full blur-[100px] animate-pulse" style={{animationDelay: '2s'}} />
-        </div>
-
-        {/* 1. Spatial Engine */}
-        <SpatialCanvas 
-            memories={memories}
-            onUpdateMemoryPosition={handleUpdateMemoryPosition}
-            onMemoryClick={setActiveMemory}
-            onDeleteMemory={handleDeleteMemory}
+        <LibraryPanel 
+            memories={filteredMemories}
+            onSelect={(m) => { setActiveMemory(m); setViewMode('focus'); }}
+            sortBy={sortBy}
+            onSortChange={setSortBy}
+            searchQuery={searchQuery}
+            onSearchChange={setSearchQuery}
+            activeId={activeMemory?.id}
+            onFilterTag={setFilterTag}
+            activeFilterTag={filterTag}
         />
 
-        {/* Factory Reset UI */}
-        <button 
-            onClick={handleReset}
-            className="fixed top-4 right-4 z-40 text-red-500/50 hover:text-red-500 bg-transparent hover:bg-red-500/10 p-2 rounded-full transition-all border border-transparent hover:border-red-500/30 group"
-            title="RESET OS (Wipe Data)"
-        >
-             <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-             </svg>
-             <span className="absolute right-full mr-2 top-1/2 -translate-y-1/2 text-xs font-mono text-red-500 opacity-0 group-hover:opacity-100 whitespace-nowrap">RESET OS</span>
-        </button>
-
-        {/* 2. Spotlight Command Bar (Floating) */}
-        <div className="fixed top-8 left-1/2 -translate-x-1/2 w-full max-w-xl z-50 px-4">
-            <div className="glass-pill rounded-full flex items-center p-1 pr-4 shadow-2xl transition-all focus-within:ring-2 focus-within:ring-cyan-500/30 ring-1 ring-white/10">
-                <div className="w-10 h-10 rounded-full bg-gradient-to-br from-gray-800 to-black flex items-center justify-center border border-white/10 shadow-inner ml-1">
-                    <div className={`w-2 h-2 rounded-full ${isProcessing ? 'bg-amber-500 animate-ping' : 'bg-cyan-500 shadow-[0_0_10px_cyan]'}`} />
+        <main className="flex-grow flex flex-col border-x border-white/5 bg-[#080808] overflow-hidden h-full min-h-0">
+            <header className="h-14 border-b border-white/5 flex-shrink-0 flex items-center justify-between px-6 bg-black/20 backdrop-blur-md z-10">
+                <div className="flex items-center gap-4">
+                    <button 
+                        onClick={() => setViewMode('canvas')}
+                        className={`text-xs font-mono px-3 py-1.5 rounded-full transition-all ${viewMode === 'canvas' ? 'bg-cyan-500 text-black font-bold' : 'text-gray-500 hover:text-white'}`}
+                    >
+                        SPATIAL CANVAS
+                    </button>
+                    <button 
+                        onClick={() => setViewMode('focus')}
+                        disabled={!activeMemory}
+                        className={`text-xs font-mono px-3 py-1.5 rounded-full transition-all ${viewMode === 'focus' ? 'bg-cyan-500 text-black font-bold' : 'text-gray-500 hover:text-white disabled:opacity-20'}`}
+                    >
+                        FOCUS WORKSPACE
+                    </button>
                 </div>
-                <input 
-                    type="text" 
-                    value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
-                    onKeyDown={(e) => e.key === 'Enter' && handleCommand()}
-                    placeholder="Ask Recall Agent..." 
-                    className="bg-transparent border-none outline-none text-white text-sm font-mono flex-grow px-4 h-full placeholder-gray-500"
-                />
-                <span className="text-[10px] text-gray-600 font-mono hidden sm:block">CMD+K</span>
-            </div>
-            
-            {/* Status Text (Below Pill) */}
-            <div className="text-center mt-3">
-                <span className="text-[10px] font-mono text-white/30 tracking-[0.2em] uppercase">{status}</span>
-            </div>
-        </div>
+                <div className="text-[10px] font-mono text-gray-600 tracking-widest uppercase">{status}</div>
+            </header>
 
-        {/* 3. Ingestion Overlay */}
-        {/* We use pointer-events-none to prevent the overlay itself from becoming the drop target and causing flicker,
-            UNLESS we handle drag events on it explicitly. Here, we rely on the parent container. */}
+            <div className="flex-grow relative overflow-hidden min-h-0 h-full">
+                {viewMode === 'canvas' ? (
+                    <SpatialCanvas 
+                        memories={filteredMemories}
+                        onUpdateMemoryPosition={(id, x, y) => setMemories(p => p.map(m => m.id === id ? {...m, x, y} : m))}
+                        onMemoryClick={(m) => { setActiveMemory(m); setViewMode('focus'); }}
+                        onDeleteMemory={(id) => { setMemories(p => p.filter(m => m.id !== id)); if(activeMemory?.id === id) setActiveMemory(null); }}
+                    />
+                ) : (
+                    activeMemory && (
+                        <MemoryViewer 
+                            memory={activeMemory}
+                            isEmbedded={true}
+                            onClose={() => setViewMode('canvas')}
+                            onUpdate={(updated) => {
+                                setMemories(p => p.map(m => m.id === updated.id ? updated : m));
+                                setActiveMemory(updated);
+                            }}
+                            onDelete={(id) => { 
+                                setMemories(p => p.filter(m => m.id !== id)); 
+                                setActiveMemory(null);
+                                setViewMode('canvas'); 
+                            }}
+                        />
+                    )
+                )}
+            </div>
+        </main>
+
+        <AgentPanel 
+            history={chatHistory}
+            onCommand={handleAgentCommand}
+            isProcessing={isProcessing}
+        />
+
         {isDraggingFile && (
-            <div className="absolute inset-0 z-[60] bg-cyan-500/10 backdrop-blur-sm flex items-center justify-center border-4 border-cyan-500/30 m-4 rounded-3xl pointer-events-none">
-                <h1 className="text-4xl font-black text-cyan-400 tracking-widest animate-pulse">INGEST DATA</h1>
+            <div className="absolute inset-0 z-[100] bg-cyan-500/10 backdrop-blur-sm flex items-center justify-center border-4 border-cyan-500/30 m-4 rounded-3xl pointer-events-none">
+                <h1 className="text-4xl font-black text-cyan-400 tracking-widest animate-pulse">INGESTING DATA...</h1>
             </div>
-        )}
-
-        {/* 4. Memory Viewer (Modal) */}
-        {activeMemory && (
-            <MemoryViewer 
-                memory={activeMemory} 
-                onClose={() => setActiveMemory(null)}
-                onUpdate={(updated) => {
-                    setMemories(prev => prev.map(m => m.id === updated.id ? updated : m));
-                    setActiveMemory(updated);
-                }}
-                onDelete={(id) => {
-                    handleDeleteMemory(id);
-                    setActiveMemory(null);
-                }}
-            />
         )}
     </div>
   );

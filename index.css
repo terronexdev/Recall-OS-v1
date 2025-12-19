@@ -1,15 +1,7 @@
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
-
-@layer utilities {
-  .perspective-1000 {
-    perspective: 1000px;
-  }
-  .preserve-3d {
-    transform-style: preserve-3d;
-  }
-}
 
 body {
   font-family: 'Inter', sans-serif;
@@ -56,11 +48,11 @@ body {
     inset 0 1px 0 rgba(255,255,255,0.1);
 }
 
-/* 3D Card Hover Effects */
-.memory-card-3d {
-  transition: transform 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275), box-shadow 0.4s ease;
+/* Scrollbar Hide Utility */
+.scrollbar-hide::-webkit-scrollbar {
+  display: none;
 }
-.memory-card-3d:hover {
-  transform: translateY(-8px) scale(1.02);
-  z-index: 50;
+.scrollbar-hide {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
 }
